@@ -8,29 +8,14 @@ English | [中文](README.zh.md)
 [![Demo Dataset](https://img.shields.io/badge/Demo%20Dataset-Download%20Phase%201-f59e0b?style=for-the-badge&logo=googledrive&logoColor=white&labelColor=0f172a)](https://drive.google.com/file/d/1n8vrRIjhVz0STj1DYZ7fSNL2JHtswu4J/view?usp=share_link)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=0f172a)](https://discord.gg/vRr7uyK9)
 
-<a href="https://dataagent.top">
-  <img
-    src="https://d2xsxph8kpxj0f.cloudfront.net/309929888595348014/k6TzcnvWPaeuGCVUYcdNr5/benchmark-diagram-agB6aG6FKBYCouJxNEbHqx.webp"
-    alt="DataAgent-Bench teaser"
-    width="920"
-  />
-</a>
-
 </div>
 
 > ReAct baseline for the public DABench demo set. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
 
-## KDD Cup Context
+## Overview
 
 | Item | Value |
 | --- | --- |
-| Competition | KDD Cup 2026: Data Agents for Complex Data Analysis |
-| Stage | Phase 1 public demo baseline |
-| Task | Autonomous data analysis over heterogeneous task contexts |
-| Evaluation | Public demo uses `data/public/output/`; hidden test sets provide `input/` only |
-
-## At a Glance
-
 | Dataset input | `data/public/input/` |
 | Public demo ground truth | `data/public/output/task_<id>/gold.csv` |
 | Hidden test data | `input/` only, no `output/` |
@@ -110,7 +95,7 @@ run:
   output_dir: artifacts/runs
   run_id:
   max_workers: 4
-  task_timeout_seconds: 900
+  task_timeout_seconds: 600
 ```
 
 Config fields:
@@ -180,6 +165,42 @@ Benchmark runs also write:
 ```text
 artifacts/runs/<run_id>/summary.json
 ```
+
+## Contact
+
+- Open issues: https://github.com/BugMaker-Boyan/kddcup2026-data-agents-starter-kit/issues
+- Official website: https://dataagent.top
+- Discord: https://discord.gg/vRr7uyK9
+- WeChat official account: `数据智能与分析实验室 DIAL`
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <a href="https://dataagent.top">
+          <img
+            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
+            alt="Official website QR code"
+            width="144"
+          />
+        </a>
+        <br />
+        Official Website
+      </td>
+      <td align="center">
+        <a href="https://discord.gg/vRr7uyK9">
+          <img
+            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.gg/vRr7uyK9&bgcolor=ffffff&color=111827&margin=8"
+            alt="Discord QR code"
+            width="144"
+          />
+        </a>
+        <br />
+        Discord
+      </td>
+    </tr>
+  </table>
+</div>
 
 ## Main Modules
 

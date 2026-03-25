@@ -8,29 +8,14 @@
 [![Demo 数据集](https://img.shields.io/badge/Demo%20Dataset-Download%20Phase%201-f59e0b?style=for-the-badge&logo=googledrive&logoColor=white&labelColor=0f172a)](https://drive.google.com/file/d/1n8vrRIjhVz0STj1DYZ7fSNL2JHtswu4J/view?usp=share_link)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=0f172a)](https://discord.gg/vRr7uyK9)
 
-<a href="https://dataagent.top">
-  <img
-    src="https://d2xsxph8kpxj0f.cloudfront.net/309929888595348014/k6TzcnvWPaeuGCVUYcdNr5/benchmark-diagram-agB6aG6FKBYCouJxNEbHqx.webp"
-    alt="DataAgent-Bench teaser"
-    width="920"
-  />
-</a>
-
 </div>
 
 > 面向 DABench 公开 demo 数据集的 ReAct baseline。仓库默认读取 `data/public/input/`，并为后续评测生成预测结果。
 
-## KDD Cup 背景
+## Overview
 
 | 项目 | 内容 |
 | --- | --- |
-| 赛事 | KDD Cup 2026: Data Agents for Complex Data Analysis |
-| 阶段 | Phase 1 公开 demo baseline |
-| 任务 | 面向异构任务上下文的自治数据分析 |
-| 评测 | 公开 demo 使用 `data/public/output/`；hidden test 仅提供 `input/` |
-
-## 一览
-
 | 数据输入 | `data/public/input/` |
 | 公开 demo 标准答案 | `data/public/output/task_<id>/gold.csv` |
 | hidden test 数据 | 仅提供 `input/`，不提供 `output/` |
@@ -110,7 +95,7 @@ run:
   output_dir: artifacts/runs
   run_id:
   max_workers: 4
-  task_timeout_seconds: 900
+  task_timeout_seconds: 600
 ```
 
 配置字段说明：
@@ -180,6 +165,42 @@ artifacts/runs/<run_id>/<task_id>/
 ```text
 artifacts/runs/<run_id>/summary.json
 ```
+
+## Contact
+
+- 问题反馈： https://github.com/BugMaker-Boyan/kddcup2026-data-agents-starter-kit/issues
+- 官方网站： https://dataagent.top
+- Discord： https://discord.gg/vRr7uyK9
+- 微信公众号：`数据智能与分析实验室 DIAL`
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center">
+        <a href="https://dataagent.top">
+          <img
+            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
+            alt="Official website QR code"
+            width="144"
+          />
+        </a>
+        <br />
+        官方网站
+      </td>
+      <td align="center">
+        <a href="https://discord.gg/vRr7uyK9">
+          <img
+            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.gg/vRr7uyK9&bgcolor=ffffff&color=111827&margin=8"
+            alt="Discord QR code"
+            width="144"
+          />
+        </a>
+        <br />
+        Discord
+      </td>
+    </tr>
+  </table>
+</div>
 
 ## 主要模块
 
