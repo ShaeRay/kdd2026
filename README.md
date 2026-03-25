@@ -1,6 +1,6 @@
 <div align="center">
 
-# DABench ReAct Baseline
+# DataAgent-Bench Starter Kit
 
 English | [中文](README.zh.md)
 
@@ -10,7 +10,7 @@ English | [中文](README.zh.md)
 
 </div>
 
-> ReAct baseline for the public DABench demo set. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
+> Official starter kit for the KDD Cup 2026 DataAgent-Bench challenge. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
 
 ## Overview
 
@@ -168,7 +168,7 @@ artifacts/runs/<run_id>/summary.json
 
 ## Contact
 
-- Open issues: https://github.com/BugMaker-Boyan/kddcup2026-data-agents-starter-kit/issues
+- Open issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
 - Official website: https://dataagent.top
 - Discord: https://discord.gg/vRr7uyK9
 - WeChat official account: `数据智能与分析实验室 DIAL`
