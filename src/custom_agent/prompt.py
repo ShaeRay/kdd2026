@@ -34,8 +34,9 @@ DO NOT output anything else. DO NOT output the answer directly. You MUST use too
 - `read_doc`: Read a text/markdown document (.md, .txt files)
   Example: {"thought": "Read the knowledge file", "action": "read_doc", "action_input": {"path": "knowledge.md"}}
 
-- `read_csv`: Read a CSV file
-  Example: {"thought": "Read the data file", "action": "read_csv", "action_input": {"path": "data.csv", "max_rows": 50}}
+- `read_csv`: Preview CSV file structure (first 50 rows, shows total_rows)
+  Example: {"thought": "Preview data structure", "action": "read_csv", "action_input": {"path": "data.csv"}}
+  NOTE: Returns preview with total_rows count. For large files (>50 rows), use execute_python to process all data.
 
 - `read_json`: Read a JSON file (.json files only)
   Example: {"thought": "Read JSON data", "action": "read_json", "action_input": {"path": "data.json"}}
@@ -44,7 +45,17 @@ DO NOT output anything else. DO NOT output the answer directly. You MUST use too
   Example: {"thought": "Query the database", "action": "execute_sql", "action_input": {"path": "db.sqlite", "sql": "SELECT * FROM table LIMIT 10"}}
 
 - `execute_python`: Run Python code for complex processing
-  Example: {"thought": "Process data", "action": "execute_python", "action_input": {"code": "import json\\nprint('FINAL_ANSWER:', json.dumps({'columns': ['id'], 'rows': [[1], [2]]}))"}}
+  Example: {"thought": "Process data", "action": "execute_python", "action_input": {"code": "import json\\ndata = [1,2,3]\\nprint('FINAL_ANSWER:', json.dumps({'columns': ['id'], 'rows': [[x] for x in data]}))"}}
+  
+  **CRITICAL**: The `code` parameter must be a SINGLE LINE string with `\\n` for newlines. DO NOT write multi-line code directly in JSON. Always escape newlines as `\\n`.
+  
+  Example of CORRECT usage:
+  {"code": "with open('file.txt') as f:\\n    content = f.read()\\nprint(content)"}
+  
+  Example of WRONG usage (will cause JSON parse error):
+  {"code": "with open('file.txt') as f:
+      content = f.read()
+  print(content)"}
 
 **IMPORTANT**: For large result sets (>50 rows), use execute_python and print `FINAL_ANSWER:` followed by JSON with columns and rows. This avoids JSON truncation issues.
 
@@ -66,6 +77,8 @@ DO NOT output anything else. DO NOT output the answer directly. You MUST use too
 - The `answer` tool requires `columns` (list of strings) and `rows` (list of lists)
 - Use `read_doc` for .md/.txt files, `read_json` for .json files, `read_csv` for .csv files
 - DO NOT make assumptions about data values - always verify from the actual data or documentation
+- If context has NO data files (csv/db/json), check if documentation contains the needed information directly
+- DO NOT search for external files outside the context directory - all data is within context
 
 ## IMPORTANT: For large result sets (>50 rows)
 When the answer has many rows, use execute_python to compute the result and print it in this EXACT format:

@@ -112,29 +112,62 @@ def tool_read_csv(task: PublicTask, action_input: dict) -> ToolResult:
     """
     读取 CSV 文件预览
     
+    智能预览策略：
+    - 默认只返回前 50 行用于了解数据结构
+    - 同时返回 total_rows 让 agent 知晓总行数
+    - 如果请求行数超过 100，强制预览模式并提示使用 execute_python
+    
     Args:
         task: 任务对象
         action_input: 包含 path 和可选的 max_rows 参数
     
     Returns:
-        包含 columns（列名）、rows（数据行）、row_count（总行数）的结果
+        包含 columns、rows（预览）、total_rows、preview_mode 的结果
     """
     path = resolve_context_path(task, str(action_input["path"]))
-    max_rows = int(action_input.get("max_rows", 50))
+    requested_rows = int(action_input.get("max_rows", 50))
+    
+    preview_limit = 50
+    if requested_rows > 100:
+        max_rows = preview_limit
+        forced_preview = True
+    else:
+        max_rows = min(requested_rows, preview_limit)
+        forced_preview = False
+    
     with path.open(newline="") as f:
         reader = csv.reader(f)
         rows = list(reader)
+    
     if not rows:
-        return ToolResult(ok=True, content={"path": str(action_input["path"]), "columns": [], "rows": [], "row_count": 0})
+        return ToolResult(ok=True, content={
+            "path": str(action_input["path"]),
+            "columns": [],
+            "rows": [],
+            "row_count": 0,
+            "total_rows": 0,
+            "preview_mode": False,
+        })
+    
     header = rows[0]
     data_rows = rows[1:]
-    return ToolResult(ok=True, content={
+    total_rows = len(data_rows)
+    
+    content = {
         "path": str(action_input["path"]),
         "columns": header,
         "rows": data_rows[:max_rows],
-        "row_count": len(data_rows),
-        "total_rows": len(data_rows),
-    })
+        "row_count": max_rows,
+        "total_rows": total_rows,
+        "preview_mode": total_rows > max_rows,
+    }
+    
+    if forced_preview:
+        content["hint"] = f"File has {total_rows} rows. Preview shows first {max_rows} rows. Use execute_python for full data processing."
+    elif total_rows > max_rows:
+        content["hint"] = f"File has {total_rows} rows. Showing first {max_rows}. Use execute_python to process all data."
+    
+    return ToolResult(ok=True, content=content)
 
 
 def tool_read_json(task: PublicTask, action_input: dict) -> ToolResult:
@@ -360,8 +393,8 @@ TOOL_SPECS = {
         "input_schema": {"max_depth": 4},
     },
     "read_csv": {
-        "description": "Preview a CSV file.",
-        "input_schema": {"path": "file.csv", "max_rows": 50},
+        "description": "Preview CSV file structure (first 50 rows). Returns columns, preview rows, and total_rows. For large files, use execute_python.",
+        "input_schema": {"path": "file.csv"},
     },
     "read_json": {
         "description": "Preview a JSON file.",

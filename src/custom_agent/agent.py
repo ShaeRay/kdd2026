@@ -64,6 +64,49 @@ def strip_json_fence(raw: str) -> str:
     return text
 
 
+def fix_json_code_field(text: str) -> str:
+    """
+    修复 JSON 中 code 字段的未转义换行符
+    
+    问题：LLM 有时会在 action_input.code 中直接写入多行代码，
+    导致 JSON 解析失败。
+    
+    解决方案：找到 "code": " 后的内容，将其中的换行符转义为 \\n
+    
+    Args:
+        text: 可能包含问题的 JSON 文本
+    
+    Returns:
+        修复后的 JSON 文本
+    """
+    # 查找 "code": " 的位置
+    code_key_pattern = r'"code"\s*:\s*"'
+    match = re.search(code_key_pattern, text)
+    if not match:
+        return text
+    
+    start = match.end()
+    
+    # 找到 code 字段的结束位置（匹配的结束引号）
+    # 需要处理转义引号和嵌套结构
+    depth = 0
+    i = start
+    while i < len(text):
+        char = text[i]
+        if char == '\\' and i + 1 < len(text):
+            i += 2
+            continue
+        if char == '"':
+            # 找到了结束引号
+            code_content = text[start:i]
+            # 转义换行符
+            fixed_code = code_content.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            return text[:start] + fixed_code + text[i:]
+        i += 1
+    
+    return text
+
+
 def parse_model_response(raw: str) -> ModelStep:
     """
     解析模型响应为结构化的步骤
@@ -83,6 +126,10 @@ def parse_model_response(raw: str) -> ModelStep:
         ValueError: JSON 无效或缺少必需字段
     """
     normalized = strip_json_fence(raw)
+    
+    # 尝试修复 code 字段中的未转义换行符
+    normalized = fix_json_code_field(normalized)
+    
     try:
         payload, end = json.JSONDecoder().raw_decode(normalized)
     except json.JSONDecodeError as e:
