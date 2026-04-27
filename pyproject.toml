@@ -32,7 +32,7 @@ dev = [
 
 [project.scripts]
 dabench = "data_agent_baseline.cli:main"
-custom-agent = "custom_agent.cli:app"
+custom-agent = "custom_agent.cli:main"
 
 [tool.ruff]
 line-length = 100

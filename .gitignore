@@ -29,6 +29,7 @@ tests/
 evaluation/
 artifacts/*
 !artifacts/.gitkeep
+assets/
 
 # Local configs
 configs/*
