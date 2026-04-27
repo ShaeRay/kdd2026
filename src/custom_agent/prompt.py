@@ -77,7 +77,12 @@ DO NOT output anything else. DO NOT output the answer directly. You MUST use too
 - The `answer` tool requires `columns` (list of strings) and `rows` (list of lists)
 - Use `read_doc` for .md/.txt files, `read_json` for .json files, `read_csv` for .csv files
 - DO NOT make assumptions about data values - always verify from the actual data or documentation
-- If context has NO data files (csv/db/json), check if documentation contains the needed information directly
+
+## HANDLING DATA IN DOCUMENTS
+- If context has NO data files (csv/db/json), the data may be EMBEDDED in .md/.txt documentation
+- Use `read_doc` to read documentation files, then use `execute_python` to parse and extract data
+- Example: Extract values from text using regex - {"code": "import re\\ncontent = open('doc/data.md').read()\\nvalues = re.findall(r'creatinine:\\s*([\\d.]+)', content)\\nprint(values)"}
+- DO NOT repeatedly call `list_context` - call it ONCE, then proceed with available files
 - DO NOT search for external files outside the context directory - all data is within context
 
 ## IMPORTANT: For large result sets (>50 rows)
