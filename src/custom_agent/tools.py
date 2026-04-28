@@ -6,6 +6,7 @@
 - 文件系统工具：list_context, read_csv, read_json, read_doc
 - 数据库工具：inspect_sqlite, execute_sql
 - 代码执行工具：execute_python
+- 数据提取工具：extract_patterns
 - 答案提交工具：answer
 
 安全机制：
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -386,6 +388,152 @@ def tool_answer(task: PublicTask, action_input: dict) -> ToolResult:
     )
 
 
+def tool_extract_patterns(task: PublicTask, action_input: dict) -> ToolResult:
+    """
+    从文档中提取匹配模式的数据
+    
+    用于从非结构化文本（如 .md 文档）中提取结构化数据。
+    支持多个命名 pattern，返回匹配结果列表。
+    
+    Args:
+        task: 任务对象
+        action_input: 包含以下参数：
+            - path: 文档路径
+            - patterns: 字典，key 为字段名，value 为正则表达式
+            - combine: 可选，是否将同一位置的匹配组合为一条记录（默认 False）
+            - include_context: 可选，是否包含匹配位置的上下文文本（默认 False）
+            - context_chars: 可选，上下文字符数（默认 200）
+            - all_groups: 可选，是否返回所有捕获组（默认 False，仅返回第一个）
+            - search_window: 可选，combine 模式下搜索窗口大小（默认 500）
+            - search_forward: 可选，combine 模式下是否只向前搜索（默认 True，避免匹配到前一条记录的数据）
+            - limit: 可选，返回结果数量限制（默认 100，避免返回过多数据）
+    
+    Returns:
+        包含 matches（匹配结果列表）和 total_matches（总匹配数）的结果
+    
+    Example:
+        action_input = {
+            "path": "doc/Laboratory.md",
+            "patterns": {
+                "patient_id": r"patient\s+(\d+)",
+                "creatinine": r"creatinine[^;]*?(\d+\.\d+)\s*mg/dL"
+            },
+            "combine": True,
+            "include_context": True,
+            "all_groups": True
+        }
+    """
+    path = resolve_context_path(task, str(action_input["path"]))
+    patterns = action_input.get("patterns", {})
+    combine = action_input.get("combine", False)
+    include_context = action_input.get("include_context", False)
+    context_chars = int(action_input.get("context_chars", 200))
+    all_groups = action_input.get("all_groups", False)
+    search_window = int(action_input.get("search_window", 500))
+    search_forward = action_input.get("search_forward", True)
+    limit = int(action_input.get("limit", 500))
+    
+    if not patterns:
+        raise ValueError("patterns must be a non-empty dictionary")
+    
+    text = path.read_text(errors="replace")
+    
+    def extract_match_value(match: re.Match) -> Any:
+        if not match.groups():
+            return match.group(0)
+        if all_groups:
+            groups = match.groups()
+            return groups[0] if len(groups) == 1 else list(groups)
+        return match.group(1)
+    
+    def extract_match_context(match: re.Match, text: str, chars: int) -> str:
+        start = max(0, match.start() - chars)
+        end = min(len(text), match.end() + chars)
+        return text[start:end]
+    
+    if combine:
+        pattern_names = list(patterns.keys())
+        primary_name = pattern_names[0]
+        primary_pattern = patterns[primary_name]
+        
+        combined_matches = []
+        total_count = 0
+        for match in re.finditer(primary_pattern, text, re.IGNORECASE):
+            total_count += 1
+            if len(combined_matches) >= limit:
+                continue
+            
+            record = {primary_name: extract_match_value(match)}
+            record["_matched_text"] = match.group(0)
+            
+            if search_forward:
+                context_start = match.start()
+                context_end = min(len(text), match.end() + search_window)
+            else:
+                context_start = max(0, match.start() - search_window)
+                context_end = min(len(text), match.end() + search_window)
+            context = text[context_start:context_end]
+            
+            if include_context:
+                record["_context"] = context
+            
+            for name in pattern_names[1:]:
+                other_pattern = patterns[name]
+                other_match = re.search(other_pattern, context, re.IGNORECASE)
+                if other_match:
+                    record[name] = extract_match_value(other_match)
+                    record[f"_{name}_matched_text"] = other_match.group(0)
+                else:
+                    record[name] = None
+            
+            combined_matches.append(record)
+        
+        return ToolResult(ok=True, content={
+            "path": str(action_input["path"]),
+            "matches": combined_matches,
+            "total_matches": total_count,
+            "returned_matches": len(combined_matches),
+            "truncated": total_count > limit,
+            "mode": "combined",
+        })
+    else:
+        results = {}
+        matched_texts = {}
+        contexts = {} if include_context else None
+        total_count = 0
+        for name, pattern in patterns.items():
+            matches = []
+            texts = []
+            match_contexts = [] if include_context else None
+            count = 0
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                count += 1
+                total_count += 1
+                if len(matches) < limit:
+                    matches.append(extract_match_value(match))
+                    texts.append(match.group(0))
+                    if include_context:
+                        match_contexts.append(extract_match_context(match, text, context_chars))
+            results[name] = matches
+            matched_texts[name] = texts
+            if include_context:
+                contexts[name] = match_contexts
+        
+        content = {
+            "path": str(action_input["path"]),
+            "matches": results,
+            "matched_texts": matched_texts,
+            "total_matches": total_count,
+            "returned_matches": sum(len(v) for v in results.values()),
+            "truncated": total_count > limit,
+            "mode": "independent",
+        }
+        if include_context:
+            content["contexts"] = contexts
+        
+        return ToolResult(ok=True, content=content)
+
+
 # 工具规格定义：用于生成工具描述给模型
 TOOL_SPECS = {
     "list_context": {
@@ -416,6 +564,10 @@ TOOL_SPECS = {
         "description": f"Execute Python code (timeout: {EXECUTE_PYTHON_TIMEOUT}s). Working dir is context/. To submit answer, print 'FINAL_ANSWER:' followed by JSON: {{\"columns\": [...], \"rows\": [...]}}",
         "input_schema": {"code": "import pandas as pd\n...\nprint('FINAL_ANSWER:', json.dumps({'columns': ['id'], 'rows': [[1], [2]]}))"},
     },
+    "extract_patterns": {
+        "description": "Extract structured data from documents using regex patterns. Use when data is embedded in text (e.g., patient data in .md files). Set include_context=true to see surrounding text for validation. Set all_groups=true to return all capture groups. Returns matched_texts for verification. By default, searches forward from primary match to avoid matching previous records. Default limit=500.",
+        "input_schema": {"path": "doc/file.md", "patterns": {"patient_id": r"patient\s+(\d+)", "creatinine": r"creatinine[^;]*?(\d+\.\d+)\s*mg/dL"}, "combine": True, "include_context": True, "all_groups": False, "search_window": 500, "search_forward": True, "limit": 500},
+    },
     "answer": {
         "description": "Submit final answer table. This terminates the task.",
         "input_schema": {"columns": ["col1", "col2"], "rows": [["val1", "val2"]]},
@@ -431,6 +583,7 @@ TOOL_HANDLERS = {
     "inspect_sqlite": tool_inspect_sqlite,
     "execute_sql": tool_execute_sql,
     "execute_python": tool_execute_python,
+    "extract_patterns": tool_extract_patterns,
     "answer": tool_answer,
 }
 
