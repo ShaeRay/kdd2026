@@ -1,16 +1,15 @@
 """
-Agent 核心模块
+v4 Agent 核心模块
 
-实现 ReAct 风格的 Agent 循环：
-1. 构建消息（系统提示词 + 任务提示词 + 历史步骤）
-2. 调用模型获取响应
-3. 解析响应为 (thought, action, action_input)
-4. 执行工具获取观察结果
-5. 重复直到获得答案或达到最大步数
+采用 plan-and-execute 架构，并将控制流拆成三个角色：
+1. planner: 基于任务画像生成执行计划
+2. executor: 按当前子目标调用受限工具
+3. verifier: 对最终答案进行一次轻量校验
 
-错误恢复机制：
-- 连续 3 次格式错误才终止，单次错误继续循环
-- 工具执行错误记录但不终止循环
+设计目标：
+- 用非 LLM 路由隔离简单任务与文档型复杂任务
+- 避免单个超长 Prompt 同时承担规划、执行、纠错和验证
+- 保持 CLI 与 runner 接口不变，降低迁移成本
 """
 
 from __future__ import annotations
@@ -18,141 +17,269 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage, ModelStep
 from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState, StepRecord
-from data_agent_baseline.benchmark.schema import PublicTask
+from data_agent_baseline.benchmark.schema import AnswerTable, PublicTask
 
-from custom_agent.prompt import build_system_prompt, build_task_prompt, build_observation_prompt
-from custom_agent.tools import execute_tool
+from custom_agent.prompt import (
+    build_executor_system_prompt,
+    build_executor_user_prompt,
+    build_observation_prompt,
+    build_planner_system_prompt,
+    build_planner_user_prompt,
+    build_verifier_system_prompt,
+    build_verifier_user_prompt,
+)
+from custom_agent.tools import describe_tools, execute_tool
+
+PLAN_ACTION = "__plan__"
+STEP_DONE_ACTION = "__step_done__"
+VERIFY_ACTION = "__verify__"
+FORMAT_ERROR_ACTION = "__format_error__"
 
 
 @dataclass(frozen=True, slots=True)
 class CustomAgentConfig:
     """
-    Agent 配置
-    
-    Attributes:
-        max_steps: 最大执行步数，防止无限循环
+    v4 配置
+
+    max_steps 仅限制 executor 回合数。
+    planner 和 verifier 属于固定编排开销，不占用该预算。
     """
+
     max_steps: int = 25
+    max_plan_steps: int = 5
+    max_repair_attempts: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProfile:
+    mode: str
+    available_tools: list[str]
+    context_files: list[str]
+    file_type_counts: dict[str, int]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "available_tools": list(self.available_tools),
+            "context_files": list(self.context_files),
+            "file_type_counts": dict(self.file_type_counts),
+        }
+
+    def summary_text(self) -> str:
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(self.file_type_counts.items()))
+        files_preview = ", ".join(self.context_files[:12]) if self.context_files else "none"
+        if len(self.context_files) > 12:
+            files_preview += ", ..."
+        return (
+            f"mode={self.mode}\n"
+            f"file_type_counts={counts or 'none'}\n"
+            f"context_files={files_preview}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPlanStep:
+    step_id: str
+    title: str
+    goal: str
+    allowed_tools: list[str]
+    exit_criteria: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.step_id,
+            "title": self.title,
+            "goal": self.goal,
+            "allowed_tools": list(self.allowed_tools),
+            "exit_criteria": self.exit_criteria,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPlan:
+    summary: str
+    steps: list[ExecutionPlanStep]
+    final_columns: list[str]
+    verification_checks: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "steps": [step.to_dict() for step in self.steps],
+            "final_columns": list(self.final_columns),
+            "verification_checks": list(self.verification_checks),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationResult:
+    approved: bool
+    issues: list[str]
+    repair_goal: str
+    recommended_tools: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "approved": self.approved,
+            "issues": list(self.issues),
+            "repair_goal": self.repair_goal,
+            "recommended_tools": list(self.recommended_tools),
+        }
+
+
+def infer_task_profile(task: PublicTask) -> TaskProfile:
+    context_files: list[str] = []
+    counts = {
+        "csv": 0,
+        "json": 0,
+        "db": 0,
+        "doc": 0,
+        "other": 0,
+    }
+    context_root = task.context_dir
+    for path in sorted(context_root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel_path = path.relative_to(context_root).as_posix()
+        context_files.append(rel_path)
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            counts["csv"] += 1
+        elif suffix == ".json":
+            counts["json"] += 1
+        elif suffix in {".db", ".sqlite", ".sqlite3"}:
+            counts["db"] += 1
+        elif suffix in {".md", ".txt"}:
+            counts["doc"] += 1
+        else:
+            counts["other"] += 1
+
+    has_doc_dir = any(path.startswith("doc/") for path in context_files)
+    non_knowledge_docs = [
+        path
+        for path in context_files
+        if path.endswith((".md", ".txt")) and Path(path).name.lower() != "knowledge.md"
+    ]
+    has_structured = counts["db"] > 0 or counts["csv"] > 0 or counts["json"] > 0
+
+    if has_doc_dir and not has_structured:
+        mode = "doc_heavy"
+    elif has_doc_dir and has_structured:
+        mode = "mixed"
+    elif counts["db"] > 0:
+        mode = "structured_db"
+    elif counts["csv"] > 0 or counts["json"] > 0:
+        mode = "structured_file"
+    elif non_knowledge_docs:
+        mode = "doc_heavy"
+    else:
+        mode = "structured_file"
+
+    tool_map = {
+        "structured_db": [
+            "list_context",
+            "read_doc",
+            "inspect_sqlite",
+            "execute_sql",
+            "execute_python",
+            "answer",
+        ],
+        "structured_file": [
+            "list_context",
+            "read_doc",
+            "read_csv",
+            "read_json",
+            "execute_python",
+            "answer",
+        ],
+        "doc_heavy": [
+            "list_context",
+            "read_doc",
+            "extract_patterns",
+            "execute_python",
+            "answer",
+        ],
+        "mixed": [
+            "list_context",
+            "read_doc",
+            "read_csv",
+            "read_json",
+            "inspect_sqlite",
+            "execute_sql",
+            "extract_patterns",
+            "execute_python",
+            "answer",
+        ],
+    }
+    return TaskProfile(
+        mode=mode,
+        available_tools=tool_map[mode],
+        context_files=context_files,
+        file_type_counts=counts,
+    )
 
 
 def strip_json_fence(raw: str) -> str:
-    """
-    去除 JSON 代码围栏
-    
-    支持两种格式：
-    - ```json ... ```（推荐）
-    - ``` ... ```（通用）
-    
-    Args:
-        raw: 原始响应文本
-    
-    Returns:
-        去除围栏后的 JSON 文本
-    """
     text = raw.strip()
-    # 优先匹配 ```json 围栏
-    m = re.search(r"```json\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # 其次匹配通用围栏
-    m = re.search(r"```\s*(.*?)\s*```", text, flags=re.DOTALL)
-    if m:
-        return m.group(1).strip()
+    fenced = re.search(r"```json\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+    generic = re.search(r"```\s*(.*?)\s*```", text, flags=re.DOTALL)
+    if generic:
+        return generic.group(1).strip()
     return text
 
 
 def fix_json_code_field(text: str) -> str:
-    """
-    修复 JSON 中 code 字段的未转义换行符
-    
-    问题：LLM 有时会在 action_input.code 中直接写入多行代码，
-    导致 JSON 解析失败。
-    
-    解决方案：找到 "code": " 后的内容，将其中的换行符转义为 \\n
-    
-    Args:
-        text: 可能包含问题的 JSON 文本
-    
-    Returns:
-        修复后的 JSON 文本
-    """
-    # 查找 "code": " 的位置
-    code_key_pattern = r'"code"\s*:\s*"'
-    match = re.search(code_key_pattern, text)
+    match = re.search(r'"code"\s*:\s*"', text)
     if not match:
         return text
-    
+
     start = match.end()
-    
-    # 找到 code 字段的结束位置（匹配的结束引号）
-    # 需要处理转义引号和嵌套结构
-    depth = 0
     i = start
     while i < len(text):
         char = text[i]
-        if char == '\\' and i + 1 < len(text):
+        if char == "\\" and i + 1 < len(text):
             i += 2
             continue
         if char == '"':
-            # 找到了结束引号
             code_content = text[start:i]
-            # 转义换行符
-            fixed_code = code_content.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            fixed_code = code_content.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
             return text[:start] + fixed_code + text[i:]
         i += 1
-    
     return text
 
 
-def parse_model_response(raw: str) -> ModelStep:
-    """
-    解析模型响应为结构化的步骤
-    
-    期望格式：
-    ```json
-    {"thought": "...", "action": "...", "action_input": {...}}
-    ```
-    
-    Args:
-        raw: 模型原始响应文本
-    
-    Returns:
-        包含 thought、action、action_input 的 ModelStep 对象
-    
-    Raises:
-        ValueError: JSON 无效或缺少必需字段
-    """
-    normalized = strip_json_fence(raw)
-    
-    # 尝试修复 code 字段中的未转义换行符
-    normalized = fix_json_code_field(normalized)
-    
+def load_single_json_payload(raw: str) -> dict[str, Any]:
+    normalized = fix_json_code_field(strip_json_fence(raw))
     try:
         payload, end = json.JSONDecoder().raw_decode(normalized)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {e}") from e
-    # 检查是否有额外内容
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON: {exc}") from exc
+
     remainder = normalized[end:].strip()
     if remainder:
-        cleaned = re.sub(r"(?:\\[nrt])+", "", remainder).strip()
-        if cleaned:
-            raise ValueError(f"Extra content after JSON: {cleaned[:100]}")
-    # 验证必需字段
+        cleaned = remainder.replace("```", "").strip()
+        cleaned = re.sub(r"(?:\\[nrt])+", "", cleaned).strip()
+        cleaned = cleaned.strip("}")
+        if cleaned.strip():
+            raise ValueError(f"Extra content after JSON: {remainder[:100]}")
+
     if not isinstance(payload, dict):
         raise ValueError(f"Response must be a JSON object, got {type(payload).__name__}")
-    if "thought" not in payload:
-        raise ValueError("Missing required field: 'thought'")
-    if "action" not in payload:
-        raise ValueError("Missing required field: 'action'")
-    if "action_input" not in payload:
-        raise ValueError("Missing required field: 'action_input'")
-    thought = payload["thought"]
-    action = payload["action"]
-    action_input = payload["action_input"]
-    # 验证字段类型
+    return payload
+
+
+def parse_model_response(raw: str) -> ModelStep:
+    payload = load_single_json_payload(raw)
+    thought = payload.get("thought", "")
+    action = payload.get("action")
+    action_input = payload.get("action_input", {})
     if not isinstance(thought, str):
         raise ValueError(f"'thought' must be a string, got {type(thought).__name__}")
     if not isinstance(action, str) or not action.strip():
@@ -162,168 +289,540 @@ def parse_model_response(raw: str) -> ModelStep:
     return ModelStep(thought=thought, action=action, action_input=action_input, raw_response=raw)
 
 
+def _unique(seq: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for item in seq:
+        if item not in seen:
+            seen.add(item)
+            output.append(item)
+    return output
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def parse_execution_plan(raw: str, profile: TaskProfile, max_plan_steps: int) -> ExecutionPlan:
+    payload = load_single_json_payload(raw)
+    summary = str(payload.get("summary", "")).strip() or "Follow a routed execution plan."
+    raw_steps = payload.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError("Planner response must include a non-empty steps list.")
+
+    steps: list[ExecutionPlanStep] = []
+    for idx, raw_step in enumerate(raw_steps[:max_plan_steps], start=1):
+        if not isinstance(raw_step, dict):
+            continue
+        title = str(raw_step.get("title", "")).strip() or f"Step {idx}"
+        goal = str(raw_step.get("goal", "")).strip() or title
+        exit_criteria = str(raw_step.get("exit_criteria", "")).strip() or "Current step goal is satisfied."
+        requested_tools = _coerce_string_list(raw_step.get("allowed_tools"))
+        allowed_tools = [tool for tool in requested_tools if tool in profile.available_tools]
+        if not allowed_tools:
+            allowed_tools = _default_tools_for_mode(profile.mode, final_step=False)
+        steps.append(
+            ExecutionPlanStep(
+                step_id=f"step_{idx}",
+                title=title,
+                goal=goal,
+                allowed_tools=allowed_tools,
+                exit_criteria=exit_criteria,
+            )
+        )
+
+    if not steps:
+        raise ValueError("Planner response did not contain any valid steps.")
+
+    final_columns = _coerce_string_list(payload.get("final_columns"))
+    verification_checks = _coerce_string_list(payload.get("verification_checks"))
+    plan = ExecutionPlan(
+        summary=summary,
+        steps=steps,
+        final_columns=final_columns,
+        verification_checks=verification_checks,
+    )
+    return sanitize_execution_plan(plan, profile)
+
+
+def parse_verification_result(raw: str, available_tools: list[str]) -> VerificationResult:
+    payload = load_single_json_payload(raw)
+    approved = bool(payload.get("approved", False))
+    issues = _coerce_string_list(payload.get("issues"))
+    repair_goal = str(payload.get("repair_goal", "")).strip()
+    recommended_tools = [tool for tool in _coerce_string_list(payload.get("recommended_tools")) if tool in available_tools]
+    return VerificationResult(
+        approved=approved,
+        issues=issues,
+        repair_goal=repair_goal,
+        recommended_tools=recommended_tools,
+    )
+
+
+def _default_tools_for_mode(mode: str, *, final_step: bool) -> list[str]:
+    defaults = {
+        "structured_db": ["inspect_sqlite", "execute_sql", "execute_python"],
+        "structured_file": ["read_csv", "read_json", "execute_python"],
+        "doc_heavy": ["read_doc", "extract_patterns", "execute_python"],
+        "mixed": ["read_doc", "inspect_sqlite", "execute_sql", "read_csv", "read_json", "extract_patterns", "execute_python"],
+    }
+    tools = list(defaults.get(mode, ["read_doc", "execute_python"]))
+    if final_step and "answer" not in tools:
+        tools.append("answer")
+    return tools
+
+
+def build_default_plan(profile: TaskProfile) -> ExecutionPlan:
+    if profile.mode == "structured_db":
+        steps = [
+            ExecutionPlanStep("step_1", "Inspect schema", "Identify the relevant database tables and columns.", ["list_context", "read_doc", "inspect_sqlite"], "Relevant schema is known."),
+            ExecutionPlanStep("step_2", "Query data", "Use SQL to retrieve the candidate rows needed for the question.", ["execute_sql", "read_doc"], "The required rows or aggregates are available."),
+            ExecutionPlanStep("step_3", "Finalize answer", "Verify the result and submit the answer.", ["execute_sql", "execute_python", "answer"], "Final answer is ready to submit."),
+        ]
+    elif profile.mode == "structured_file":
+        steps = [
+            ExecutionPlanStep("step_1", "Inspect files", "Identify the relevant CSV or JSON files and their columns.", ["list_context", "read_doc", "read_csv", "read_json"], "Relevant file structure is understood."),
+            ExecutionPlanStep("step_2", "Compute result", "Filter and compute the result from the structured files.", ["read_csv", "read_json", "execute_python"], "The result rows are available."),
+            ExecutionPlanStep("step_3", "Finalize answer", "Verify the output schema and submit the answer.", ["execute_python", "answer"], "Final answer is ready to submit."),
+        ]
+    elif profile.mode == "doc_heavy":
+        steps = [
+            ExecutionPlanStep("step_1", "Read documents", "Read the relevant documents and identify how the data is described.", ["list_context", "read_doc"], "The source documents and extraction strategy are clear."),
+            ExecutionPlanStep("step_2", "Extract candidates", "Use document-aware tools to extract the candidate facts or records.", ["read_doc", "extract_patterns", "execute_python"], "Candidate records are extracted."),
+            ExecutionPlanStep("step_3", "Finalize answer", "Verify the extracted result against the document context and submit the answer.", ["read_doc", "execute_python", "answer"], "Final answer is ready to submit."),
+        ]
+    else:
+        steps = [
+            ExecutionPlanStep("step_1", "Map sources", "Identify which structured and document sources are relevant.", ["list_context", "read_doc", "inspect_sqlite", "read_csv", "read_json"], "The source of truth is identified."),
+            ExecutionPlanStep("step_2", "Extract data", "Retrieve the candidate data from the chosen sources.", ["execute_sql", "read_csv", "read_json", "extract_patterns", "execute_python"], "Candidate result data is available."),
+            ExecutionPlanStep("step_3", "Finalize answer", "Merge any evidence, validate the result, and submit the answer.", ["read_doc", "execute_sql", "execute_python", "answer"], "Final answer is ready to submit."),
+        ]
+
+    verification_checks = [
+        "The final rows must directly answer the question.",
+        "The column names should be explicit and stable.",
+        "Use only values verified from the task context.",
+    ]
+    return sanitize_execution_plan(
+        ExecutionPlan(
+            summary=f"Fallback {profile.mode} plan with routed tool isolation.",
+            steps=steps,
+            final_columns=[],
+            verification_checks=verification_checks,
+        ),
+        profile,
+    )
+
+
+def sanitize_execution_plan(plan: ExecutionPlan, profile: TaskProfile) -> ExecutionPlan:
+    sanitized_steps: list[ExecutionPlanStep] = []
+    total_steps = len(plan.steps)
+    for idx, step in enumerate(plan.steps, start=1):
+        final_step = idx == total_steps
+        allowed = [tool for tool in step.allowed_tools if tool in profile.available_tools]
+        if not allowed:
+            allowed = _default_tools_for_mode(profile.mode, final_step=final_step)
+        if final_step:
+            allowed = _unique(allowed + ["answer"])
+        else:
+            allowed = [tool for tool in allowed if tool != "answer"]
+        sanitized_steps.append(
+            ExecutionPlanStep(
+                step_id=f"step_{idx}",
+                title=step.title,
+                goal=step.goal,
+                allowed_tools=allowed,
+                exit_criteria=step.exit_criteria,
+            )
+        )
+
+    verification_checks = plan.verification_checks or [
+        "The answer should satisfy the question with no missing filters.",
+        "The answer schema should match the requested output.",
+    ]
+    return ExecutionPlan(
+        summary=plan.summary,
+        steps=sanitized_steps,
+        final_columns=plan.final_columns,
+        verification_checks=verification_checks,
+    )
+
+
+def build_repair_step(
+    *,
+    profile: TaskProfile,
+    repair_attempt: int,
+    verifier_result: VerificationResult,
+) -> ExecutionPlanStep:
+    recommended_tools = [
+        tool for tool in verifier_result.recommended_tools if tool in profile.available_tools and tool != "answer"
+    ]
+    if not recommended_tools:
+        recommended_tools = _default_tools_for_mode(profile.mode, final_step=False)
+    allowed_tools = _unique(recommended_tools + ["answer"])
+    goal = verifier_result.repair_goal or "Fix the draft answer using the verifier feedback."
+    return ExecutionPlanStep(
+        step_id=f"repair_{repair_attempt}",
+        title="Repair answer",
+        goal=goal,
+        allowed_tools=allowed_tools,
+        exit_criteria="Submit a corrected final answer.",
+    )
+
+
 class CustomAgent:
-    """
-    自定义 ReAct Agent
-    
-    实现 Thought-Action-Observation 循环：
-    1. 根据当前状态构建消息
-    2. 调用模型获取下一步行动
-    3. 执行工具并记录观察结果
-    4. 重复直到获得答案或达到最大步数
-    """
-    
     def __init__(
         self,
         *,
         model: ModelAdapter,
         config: CustomAgentConfig | None = None,
     ) -> None:
-        """
-        初始化 Agent
-        
-        Args:
-            model: 模型适配器，用于调用 LLM API
-            config: Agent 配置，默认使用 CustomAgentConfig()
-        """
         self.model = model
         self.config = config or CustomAgentConfig()
 
-    def _build_messages(self, task: PublicTask, state: AgentRuntimeState) -> list[ModelMessage]:
-        """
-        构建对话消息列表
-        
-        消息结构：
-        1. system: 系统提示词（定义 Agent 行为规范）
-        2. user: 任务提示词（包含具体问题）
-        3. assistant/user 交替: 历史步骤的响应和观察
-        
-        Args:
-            task: 任务对象
-            state: 运行时状态，包含已执行的步骤
-        
-        Returns:
-            完整的消息列表
-        """
-        system_content = build_system_prompt("")
-        messages = [ModelMessage(role="system", content=system_content)]
-        messages.append(ModelMessage(role="user", content=build_task_prompt(task.question)))
-        # 添加历史步骤
-        for step in state.steps:
-            messages.append(ModelMessage(role="assistant", content=step.raw_response))
-            messages.append(ModelMessage(role="user", content=build_observation_prompt(step.observation)))
+    def _plan_messages(self, task: PublicTask, profile: TaskProfile) -> list[ModelMessage]:
+        tool_catalog = describe_tools(profile.available_tools)
+        return [
+            ModelMessage(role="system", content=build_planner_system_prompt()),
+            ModelMessage(
+                role="user",
+                content=build_planner_user_prompt(
+                    question=task.question,
+                    profile_summary=profile.summary_text(),
+                    available_tools=profile.available_tools,
+                    context_files=profile.context_files,
+                    tool_catalog=tool_catalog,
+                ),
+            ),
+        ]
+
+    def _executor_messages(
+        self,
+        *,
+        task: PublicTask,
+        profile: TaskProfile,
+        plan: ExecutionPlan,
+        plan_step: ExecutionPlanStep,
+        current_step_index: int,
+        completed_step_summaries: list[str],
+        current_step_records: list[StepRecord],
+        verifier_feedback: str | None,
+    ) -> list[ModelMessage]:
+        tool_catalog = describe_tools(plan_step.allowed_tools)
+        messages = [
+            ModelMessage(role="system", content=build_executor_system_prompt()),
+            ModelMessage(
+                role="user",
+                content=build_executor_user_prompt(
+                    question=task.question,
+                    profile_summary=profile.summary_text(),
+                    plan_summary=plan.summary,
+                    current_step_index=current_step_index,
+                    total_steps=len(plan.steps),
+                    current_step_title=plan_step.title,
+                    current_step_goal=plan_step.goal,
+                    current_step_exit_criteria=plan_step.exit_criteria,
+                    allowed_actions=plan_step.allowed_tools + [STEP_DONE_ACTION],
+                    completed_step_summaries=completed_step_summaries,
+                    context_files=profile.context_files,
+                    tool_catalog=tool_catalog,
+                    verifier_feedback=verifier_feedback,
+                ),
+            ),
+        ]
+        for record in current_step_records:
+            messages.append(ModelMessage(role="assistant", content=record.raw_response))
+            messages.append(ModelMessage(role="user", content=build_observation_prompt(record.observation)))
         return messages
 
+    def _verifier_messages(
+        self,
+        *,
+        task: PublicTask,
+        profile: TaskProfile,
+        plan: ExecutionPlan,
+        completed_step_summaries: list[str],
+        answer: AnswerTable,
+    ) -> list[ModelMessage]:
+        return [
+            ModelMessage(role="system", content=build_verifier_system_prompt()),
+            ModelMessage(
+                role="user",
+                content=build_verifier_user_prompt(
+                    question=task.question,
+                    profile_summary=profile.summary_text(),
+                    plan_summary=plan.summary,
+                    verification_checks=plan.verification_checks,
+                    completed_step_summaries=completed_step_summaries,
+                    answer_columns=answer.columns,
+                    answer_rows=answer.rows,
+                    available_tools=profile.available_tools,
+                ),
+            ),
+        ]
+
+    def _record_format_error(self, state: AgentRuntimeState, step_index: int, raw_response: str, error_msg: str) -> None:
+        observation = {
+            "ok": False,
+            "error": f"Format error: {error_msg}",
+            "hint": "Respond with one JSON object only and no markdown fences.",
+        }
+        state.steps.append(
+            StepRecord(
+                step_index=step_index,
+                thought="",
+                action=FORMAT_ERROR_ACTION,
+                action_input={},
+                raw_response=raw_response,
+                observation=observation,
+                ok=False,
+            )
+        )
+
     def run(self, task: PublicTask) -> AgentRunResult:
-        """
-        运行 Agent 解决任务
-        
-        核心循环：
-        1. 调用模型获取响应
-        2. 解析响应为 (thought, action, action_input)
-        3. 执行工具获取观察结果
-        4. 如果是终止工具（answer），结束循环
-        
-        错误处理：
-        - 格式错误：记录并继续，连续 3 次才终止
-        - 工具错误：记录并继续
-        
-        Args:
-            task: 任务对象
-        
-        Returns:
-            包含答案、步骤记录、失败原因的 AgentRunResult
-        """
         state = AgentRuntimeState()
-        consecutive_errors = 0
-        max_consecutive_errors = 3
+        profile = infer_task_profile(task)
+        trace_step_index = 1
 
-        for step_index in range(1, self.config.max_steps + 1):
-            # 步骤 1: 调用模型并解析响应
-            try:
-                raw_response = self.model.complete(self._build_messages(task, state))
-                model_step = parse_model_response(raw_response)
-                consecutive_errors = 0  # 重置错误计数
-            except Exception as exc:
-                consecutive_errors += 1
-                error_msg = str(exc)
-                # 记录格式错误
-                observation = {
-                    "ok": False,
-                    "error": f"Format error: {error_msg}",
-                    "hint": "You MUST respond with: {\"thought\": \"...\", \"action\": \"tool_name\", \"action_input\": {...}}",
-                }
-                state.steps.append(StepRecord(
-                    step_index=step_index,
-                    thought="",
-                    action="__format_error__",
-                    action_input={},
-                    raw_response=raw_response if "raw_response" in dir() else "",
-                    observation=observation,
-                    ok=False,
-                ))
-                # 连续多次格式错误，终止
-                if consecutive_errors >= max_consecutive_errors:
-                    state.failure_reason = f"Too many format errors. Last error: {error_msg}"
+        plan_raw = ""
+        plan_error: str | None = None
+        try:
+            plan_raw = self.model.complete(self._plan_messages(task, profile))
+            plan = parse_execution_plan(plan_raw, profile, self.config.max_plan_steps)
+            plan_source = "planner"
+            plan_ok = True
+        except Exception as exc:
+            plan_error = str(exc)
+            plan = build_default_plan(profile)
+            plan_source = "fallback"
+            plan_ok = False
+
+        state.steps.append(
+            StepRecord(
+                step_index=trace_step_index,
+                thought=f"Route task into {profile.mode} mode and prepare a bounded plan.",
+                action=PLAN_ACTION,
+                action_input={"mode": profile.mode, "available_tools": profile.available_tools},
+                raw_response=plan_raw,
+                observation={
+                    "ok": plan_ok,
+                    "source": plan_source,
+                    "profile": profile.to_dict(),
+                    "plan": plan.to_dict(),
+                    "error": plan_error,
+                },
+                ok=plan_ok,
+            )
+        )
+        trace_step_index += 1
+
+        pending_steps = list(plan.steps)
+        completed_step_summaries: list[str] = []
+        executor_turns = 0
+        repair_attempts = 0
+
+        while pending_steps:
+            plan_step = pending_steps.pop(0)
+            verifier_feedback: str | None = None
+            current_step_records: list[StepRecord] = []
+
+            while executor_turns < self.config.max_steps:
+                raw_response = self.model.complete(
+                    self._executor_messages(
+                        task=task,
+                        profile=profile,
+                        plan=plan,
+                        plan_step=plan_step,
+                        current_step_index=len(completed_step_summaries) + 1,
+                        completed_step_summaries=completed_step_summaries,
+                        current_step_records=current_step_records,
+                        verifier_feedback=verifier_feedback,
+                    )
+                )
+                executor_turns += 1
+
+                try:
+                    model_step = parse_model_response(raw_response)
+                except Exception as exc:
+                    self._record_format_error(state, trace_step_index, raw_response, str(exc))
+                    current_step_records.append(state.steps[-1])
+                    trace_step_index += 1
+                    continue
+
+                allowed_actions = set(plan_step.allowed_tools)
+                allowed_actions.add(STEP_DONE_ACTION)
+                if model_step.action not in allowed_actions:
+                    observation = {
+                        "ok": False,
+                        "error": f"Action not allowed in this step: {model_step.action}",
+                        "allowed_actions": sorted(allowed_actions),
+                    }
+                    state.steps.append(
+                        StepRecord(
+                            step_index=trace_step_index,
+                            thought=model_step.thought,
+                            action=model_step.action,
+                            action_input=model_step.action_input,
+                            raw_response=raw_response,
+                            observation=observation,
+                            ok=False,
+                        )
+                    )
+                    current_step_records.append(state.steps[-1])
+                    trace_step_index += 1
+                    continue
+
+                if model_step.action == STEP_DONE_ACTION:
+                    summary = str(model_step.action_input.get("summary", "")).strip() or model_step.thought.strip()
+                    if not summary:
+                        summary = f"Completed {plan_step.title}."
+                    completed_step_summaries.append(f"{plan_step.step_id}: {summary}")
+                    state.steps.append(
+                        StepRecord(
+                            step_index=trace_step_index,
+                            thought=model_step.thought,
+                            action=STEP_DONE_ACTION,
+                            action_input=model_step.action_input,
+                            raw_response=raw_response,
+                            observation={
+                                "ok": True,
+                                "step_id": plan_step.step_id,
+                                "summary": summary,
+                            },
+                            ok=True,
+                        )
+                    )
+                    trace_step_index += 1
                     break
-                continue
 
-            # 步骤 2: 执行工具
-            try:
-                tool_result = execute_tool(task, model_step.action, model_step.action_input)
-                observation = {
-                    "ok": tool_result.ok,
-                    "tool": model_step.action,
-                    "content": tool_result.content,
-                }
-                state.steps.append(StepRecord(
-                    step_index=step_index,
-                    thought=model_step.thought,
-                    action=model_step.action,
-                    action_input=model_step.action_input,
-                    raw_response=raw_response,
-                    observation=observation,
-                    ok=tool_result.ok,
-                ))
-                # 如果是终止工具，保存答案并结束
-                if tool_result.is_terminal:
-                    state.answer = tool_result.answer
+                try:
+                    tool_result = execute_tool(task, model_step.action, model_step.action_input)
+                    observation = {
+                        "ok": tool_result.ok,
+                        "tool": model_step.action,
+                        "content": tool_result.content,
+                    }
+                    state.steps.append(
+                        StepRecord(
+                            step_index=trace_step_index,
+                            thought=model_step.thought,
+                            action=model_step.action,
+                            action_input=model_step.action_input,
+                            raw_response=raw_response,
+                            observation=observation,
+                            ok=tool_result.ok,
+                        )
+                    )
+                    current_step_records.append(state.steps[-1])
+                    trace_step_index += 1
+
+                    if not tool_result.is_terminal:
+                        continue
+
+                    if tool_result.answer is None:
+                        state.failure_reason = "Terminal tool returned without an answer payload."
+                        return AgentRunResult(
+                            task_id=task.task_id,
+                            answer=state.answer,
+                            steps=list(state.steps),
+                            failure_reason=state.failure_reason,
+                        )
+
+                    verify_raw = ""
+                    try:
+                        verify_raw = self.model.complete(
+                            self._verifier_messages(
+                                task=task,
+                                profile=profile,
+                                plan=plan,
+                                completed_step_summaries=completed_step_summaries,
+                                answer=tool_result.answer,
+                            )
+                        )
+                        verification = parse_verification_result(verify_raw, profile.available_tools)
+                    except Exception as exc:
+                        verification = VerificationResult(
+                            approved=True,
+                            issues=[f"Verifier fallback: {exc}"],
+                            repair_goal="",
+                            recommended_tools=[],
+                        )
+
+                    state.steps.append(
+                        StepRecord(
+                            step_index=trace_step_index,
+                            thought="Verify the draft answer before final acceptance.",
+                            action=VERIFY_ACTION,
+                            action_input={"plan_summary": plan.summary},
+                            raw_response=verify_raw,
+                            observation={"ok": verification.approved, "verification": verification.to_dict()},
+                            ok=verification.approved,
+                        )
+                    )
+                    trace_step_index += 1
+
+                    if verification.approved:
+                        state.answer = tool_result.answer
+                        return AgentRunResult(
+                            task_id=task.task_id,
+                            answer=state.answer,
+                            steps=list(state.steps),
+                            failure_reason=None,
+                        )
+
+                    if repair_attempts >= self.config.max_repair_attempts:
+                        issues = "; ".join(verification.issues) or verification.repair_goal or "Verifier rejected final answer."
+                        state.failure_reason = f"Verifier rejected final answer: {issues}"
+                        return AgentRunResult(
+                            task_id=task.task_id,
+                            answer=None,
+                            steps=list(state.steps),
+                            failure_reason=state.failure_reason,
+                        )
+
+                    repair_attempts += 1
+                    verifier_feedback = verification.repair_goal or "; ".join(verification.issues)
+                    completed_step_summaries.append(f"verifier_feedback: {verifier_feedback}")
+                    pending_steps.insert(
+                        0,
+                        build_repair_step(
+                            profile=profile,
+                            repair_attempt=repair_attempts,
+                            verifier_result=verification,
+                        ),
+                    )
                     break
-            except KeyError as exc:
-                # 未知工具
-                observation = {
-                    "ok": False,
-                    "error": f"Unknown tool: {model_step.action}",
-                    "available_tools": ["list_context", "read_csv", "read_json", "read_doc", "inspect_sqlite", "execute_sql", "execute_python", "answer"],
-                }
-                state.steps.append(StepRecord(
-                    step_index=step_index,
-                    thought=model_step.thought,
-                    action=model_step.action,
-                    action_input=model_step.action_input,
-                    raw_response=raw_response,
-                    observation=observation,
-                    ok=False,
-                ))
-            except Exception as exc:
-                # 工具执行错误
-                observation = {
-                    "ok": False,
-                    "error": f"Tool execution error: {exc}",
-                }
-                state.steps.append(StepRecord(
-                    step_index=step_index,
-                    thought=model_step.thought,
-                    action=model_step.action,
-                    action_input=model_step.action_input,
-                    raw_response=raw_response,
-                    observation=observation,
-                    ok=False,
-                ))
 
-        # 检查是否获得答案
+                except Exception as exc:
+                    state.steps.append(
+                        StepRecord(
+                            step_index=trace_step_index,
+                            thought=model_step.thought,
+                            action=model_step.action,
+                            action_input=model_step.action_input,
+                            raw_response=raw_response,
+                            observation={
+                                "ok": False,
+                                "error": f"Tool execution error: {exc}",
+                            },
+                            ok=False,
+                        )
+                    )
+                    current_step_records.append(state.steps[-1])
+                    trace_step_index += 1
+            else:
+                state.failure_reason = f"Executor did not finish within {self.config.max_steps} turns."
+                return AgentRunResult(
+                    task_id=task.task_id,
+                    answer=state.answer,
+                    steps=list(state.steps),
+                    failure_reason=state.failure_reason,
+                )
+
         if state.answer is None and state.failure_reason is None:
-            state.failure_reason = f"Agent did not submit answer within {self.config.max_steps} steps."
+            state.failure_reason = "Plan completed without submitting an answer."
 
         return AgentRunResult(
             task_id=task.task_id,

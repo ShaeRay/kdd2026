@@ -22,7 +22,7 @@ import json
 import re
 import sqlite3
 import subprocess
-import tempfile
+import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -306,7 +306,7 @@ def tool_execute_python(task: PublicTask, action_input: dict) -> ToolResult:
     context_root = task.context_dir.resolve()
     try:
         result = subprocess.run(
-            ["python3", "-c", code],
+            [sys.executable, "-c", code],
             cwd=context_root,
             capture_output=True,
             text=True,
@@ -334,7 +334,7 @@ def tool_execute_python(task: PublicTask, action_input: dict) -> ToolResult:
             answer_data = json.loads(answer_json)
             columns = answer_data.get("columns", [])
             rows = answer_data.get("rows", [])
-            if columns and rows:
+            if isinstance(columns, list) and isinstance(rows, list):
                 answer = AnswerTable(columns=list(columns), rows=[list(r) for r in rows])
                 return ToolResult(
                     ok=True,
@@ -389,7 +389,7 @@ def tool_answer(task: PublicTask, action_input: dict) -> ToolResult:
 
 
 def tool_extract_patterns(task: PublicTask, action_input: dict) -> ToolResult:
-    """
+    r"""
     从文档中提取匹配模式的数据
     
     用于从非结构化文本（如 .md 文档）中提取结构化数据。
@@ -588,7 +588,7 @@ TOOL_HANDLERS = {
 }
 
 
-def describe_tools() -> str:
+def describe_tools(tool_names: list[str] | None = None) -> str:
     """
     生成工具描述字符串
     
@@ -598,7 +598,11 @@ def describe_tools() -> str:
         格式化的工具描述字符串
     """
     lines = []
-    for name, spec in TOOL_SPECS.items():
+    selected_names = tool_names or list(TOOL_SPECS.keys())
+    for name in selected_names:
+        spec = TOOL_SPECS.get(name)
+        if spec is None:
+            continue
         lines.append(f"- {name}: {spec['description']}")
         lines.append(f"  input_schema: {spec['input_schema']}")
     return "\n".join(lines)

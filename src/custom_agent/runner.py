@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -131,10 +132,14 @@ def build_model_adapter(config: AppConfig) -> OpenAIModelAdapter:
     Returns:
         OpenAI 兼容的模型适配器
     """
+    model_name = os.environ.get("MODEL_NAME") or config.agent.model
+    api_base = os.environ.get("MODEL_API_URL") or config.agent.api_base
+    api_key = os.environ.get("MODEL_API_KEY") or config.agent.api_key
+
     return OpenAIModelAdapter(
-        model=config.agent.model,
-        api_base=config.agent.api_base,
-        api_key=config.agent.api_key,
+        model=model_name,
+        api_base=api_base,
+        api_key=api_key,
         temperature=config.agent.temperature,
     )
 
